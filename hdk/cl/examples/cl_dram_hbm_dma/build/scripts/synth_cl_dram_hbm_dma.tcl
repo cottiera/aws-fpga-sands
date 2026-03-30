@@ -41,10 +41,10 @@ print "Reading CL IP blocks"
 
 #---- User would uncomment the IP's required in their design ----
 
-## DDR IP
-read_ip [ list \
-  ${HDK_IP_SRC_DIR}/cl_ddr4/cl_ddr4.xci
-]
+## DDR IP (disabled for HBM-only build — EN_DDR=0)
+# read_ip [ list \
+#   ${HDK_IP_SRC_DIR}/cl_ddr4/cl_ddr4.xci
+# ]
 
 ## HBM IP's
 read_ip [ list \

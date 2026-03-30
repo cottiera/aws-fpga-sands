@@ -33,6 +33,11 @@
   // Uncomment to disable Virtual JTAG
   //`define DISABLE_VJTAG_DEBUG
 
+  // HBM-only configuration: disable all DDR controllers
+  `define DDR_A_ABSENT
+  `define DDR_B_ABSENT
+  `define DDR_D_ABSENT
+
   // Defining local macros that will instantiate the desired DDR controllers in
   // the CL.
   `ifndef DDR_A_ABSENT

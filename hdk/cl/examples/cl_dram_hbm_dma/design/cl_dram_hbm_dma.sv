@@ -22,7 +22,7 @@
 
 module cl_dram_hbm_dma
 #(
-  parameter EN_DDR = 1,
+  parameter EN_DDR = 0,
   parameter EN_HBM = 1
 )
 (
