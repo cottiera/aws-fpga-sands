@@ -4,7 +4,9 @@
 // Proves the data path works: host → PCIe BAR4 → AXI crossbar → HBM → back.
 //
 // Test 1: Write and read back a single 32-bit word via poke/peek.
-// Test 2: Write and read back a buffer (default 1 MB) via write_burst / peek.
+// Test 2: Write and read back a buffer via write_burst / peek.
+//         - Default: 1 MB of incrementing DWORDs
+//         - With --file: loads a file from disk into HBM instead
 //
 // Uses PCIS (BAR4 MMIO). No XDMA — the F2 Small Shell has no DMA engine.
 // ============================================================================
@@ -16,6 +18,7 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <time.h>
+#include <sys/stat.h>
 
 #include "fpga_pci.h"
 #include "fpga_mgmt.h"
@@ -75,23 +78,78 @@ static double elapsed_sec(struct timespec *a, struct timespec *b)
     return (b->tv_sec - a->tv_sec) + (b->tv_nsec - a->tv_nsec) / 1e9;
 }
 
-static int test_bulk(pci_bar_handle_t bar4, size_t size)
+static int load_file(const char *path, uint8_t **buf_out, size_t *size_out)
+{
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        log_error("Cannot stat file: %s (%s)", path, strerror(errno));
+        return -1;
+    }
+
+    size_t file_size = (size_t)st.st_size;
+    size_t aligned = (file_size + 3) & ~3ULL;
+
+    uint8_t *buf = calloc(1, aligned);
+    if (!buf) {
+        log_error("malloc failed for %zu bytes", aligned);
+        return -ENOMEM;
+    }
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        log_error("Cannot open file: %s (%s)", path, strerror(errno));
+        free(buf);
+        return -1;
+    }
+
+    size_t nread = fread(buf, 1, file_size, fp);
+    fclose(fp);
+
+    if (nread != file_size) {
+        log_error("Short read: got %zu of %zu bytes", nread, file_size);
+        free(buf);
+        return -1;
+    }
+
+    *buf_out  = buf;
+    *size_out = aligned;
+    log_info("Loaded file: %s (%zu bytes, padded to %zu for DWORD alignment)",
+             path, file_size, aligned);
+    return 0;
+}
+
+static int test_bulk(pci_bar_handle_t bar4, size_t size, const char *file_path)
 {
     int rc = 0;
     struct timespec t0, t1;
-    size_t dword_count = size / 4;
+    uint32_t *write_buf = NULL;
+    uint32_t *read_buf  = NULL;
 
-    uint32_t *write_buf = malloc(size);
-    uint32_t *read_buf  = calloc(dword_count, 4);
-    if (!write_buf || !read_buf) {
+    if (file_path) {
+        uint8_t *raw = NULL;
+        size_t   raw_size = 0;
+        rc = load_file(file_path, &raw, &raw_size);
+        if (rc) return rc;
+        write_buf = (uint32_t *)raw;
+        size = raw_size;
+    } else {
+        write_buf = malloc(size);
+        if (!write_buf) {
+            log_error("malloc failed for %zu bytes", size);
+            return -ENOMEM;
+        }
+        size_t dword_count = size / 4;
+        for (size_t i = 0; i < dword_count; i++)
+            write_buf[i] = (uint32_t)i;
+    }
+
+    size_t dword_count = size / 4;
+    read_buf = calloc(dword_count, 4);
+    if (!read_buf) {
         log_error("malloc failed for %zu bytes", size);
         rc = -ENOMEM;
         goto out;
     }
-
-    // Fill with a recognisable pattern: 0, 1, 2, 3, ...
-    for (size_t i = 0; i < dword_count; i++)
-        write_buf[i] = (uint32_t)i;
 
     // -- Write ---------------------------------------------------------------
     log_info("[Test 2] Writing %zu bytes (%zu DWORDs) to HBM at 0x%llX...",
@@ -157,9 +215,11 @@ out:
 
 static void usage(const char *prog)
 {
-    printf("Usage: %s [--slot <id>] [--size <bytes>]\n"
+    printf("Usage: %s [--slot <id>] [--size <bytes>] [--file <path>]\n"
            "  --slot   FPGA slot (default 0, hex)\n"
-           "  --size   Bulk test size in bytes (default 1 MB, must be multiple of 4)\n",
+           "  --size   Bulk test size in bytes (default 1 MB, must be multiple of 4)\n"
+           "           Ignored when --file is used (size comes from the file).\n"
+           "  --file   Load this file into HBM instead of a test pattern\n",
            prog);
 }
 
@@ -172,6 +232,7 @@ int main(int argc, char **argv)
     int rc;
     uint32_t slot_id = 0;
     size_t   size    = 1 * MB;
+    const char *file_path = NULL;
     pci_bar_handle_t bar4 = PCI_BAR_HANDLE_INIT;
 
     // Parse args
@@ -180,10 +241,12 @@ int main(int argc, char **argv)
             sscanf(argv[++i], "%x", &slot_id);
         else if (!strcmp(argv[i], "--size") && i + 1 < argc)
             size = strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--file") && i + 1 < argc)
+            file_path = argv[++i];
         else { usage(argv[0]); return 1; }
     }
 
-    if (size % 4 != 0) {
+    if (!file_path && size % 4 != 0) {
         fprintf(stderr, "Size must be a multiple of 4\n");
         return 1;
     }
@@ -197,7 +260,10 @@ int main(int argc, char **argv)
     log_info("========================================");
     log_info("  HBM Data Pipeline — Validation Test   ");
     log_info("========================================");
-    log_info("Slot: %u    Bulk size: %zu bytes (%.2f MB)", slot_id, size, size/(double)MB);
+    if (file_path)
+        log_info("Slot: %u    File: %s", slot_id, file_path);
+    else
+        log_info("Slot: %u    Bulk size: %zu bytes (%.2f MB)", slot_id, size, size/(double)MB);
 
     rc = fpga_mgmt_init();
     fail_on(rc, done, "fpga_mgmt_init failed");
@@ -230,7 +296,7 @@ int main(int argc, char **argv)
     rc = test_single_word(bar4);
     fail_on(rc, done, "Single-word test failed");
 
-    rc = test_bulk(bar4, size);
+    rc = test_bulk(bar4, size, file_path);
     fail_on(rc, done, "Bulk test failed");
 
 done:
