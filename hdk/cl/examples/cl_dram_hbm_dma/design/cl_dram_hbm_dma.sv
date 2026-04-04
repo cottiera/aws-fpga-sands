@@ -236,7 +236,9 @@ module cl_dram_hbm_dma
   assign axi_mstr_cfg_bus.ack   = 1'b1;
   assign axi_mstr_cfg_bus.rdata = 32'hdead_beef;
 
-  cl_fmindex_accel CL_FMINDEX_ACCEL
+  cl_fmindex_accel #(
+    .RAM_DELAY_CYCLES       (256                      )
+  ) CL_FMINDEX_ACCEL
   (
     .clk                    (clk_main_a0              ),
     .rst_n                  (mstr_sync_rst_n          ),
