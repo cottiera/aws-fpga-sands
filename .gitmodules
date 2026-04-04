@@ -7,3 +7,6 @@
     path = hdk/common/shell_stable/hlx
     url = https://github.com/aws/aws-fpga-resources.git
     ignore = dirty
+[submodule "sands"]
+	path = sands
+	url = git@github.com:UAlberta-ECE-492-W2026/sands.git
