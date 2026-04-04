@@ -11,6 +11,8 @@
 
 ## 1. Build the DCP
 
+Clone the `aws-fpga-sands` repo into your builder instance and switch to the `sands` branch.
+
 ```bash
 source hdk_setup.sh
 export CL_DIR=$HDK_DIR/cl/examples/cl_dram_hbm_dma
@@ -28,7 +30,7 @@ $CL_DIR/build/checkpoints/to_aws/
 
 ## 2. Create the AFI
 
-Run these scripts to submit AFI to S3, then create the FPGA image:
+Run these scripts to submit AFI to S3, then go to the AWS console and create an F2 instance:
 
 ```bash
 source $AWS_FPGA_REPO_DIR/hdk/scripts/start_venv.sh
@@ -58,6 +60,8 @@ Note that the rest of this guide takes place ***inside of the F2 instance*.**
 ---
 
 ## 4. Build the Index File
+
+First, ensure you clone the `aws-fpga-sands` repository and switch to the `sands` branch on the F2 instance. 
 
 The FM-index hardware reads a `.fmi` binary built by the `fmindexer` tool. Use the `build-sim` subcommand (not `build`) — it produces the flat binary format the hardware expects.
 
