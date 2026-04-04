@@ -17,6 +17,8 @@
 // For the BANANA MVP, the alphabet is hardcoded: A=1, B=2, N=3.
 // ============================================================================
 
+#define _DEFAULT_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +27,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <time.h>
+#include <unistd.h>
 #include <sys/stat.h>
 
 #include "fpga_pci.h"
@@ -244,6 +247,28 @@ int main(int argc, char **argv)
     fail_on(rc, done, "write_burst failed");
     log_info("[Phase 1] Index loaded into HBM.");
 
+    // Readback verification: read first 8 DWORDs back via BAR4
+    log_info("[Phase 1] Verifying HBM readback...");
+    int rb_errors = 0;
+    uint32_t *index_words = (uint32_t *)index_buf;
+    for (int i = 0; i < 8 && i < (int)dword_count; i++) {
+        uint32_t rb;
+        rc = fpga_pci_peek(bar4, HBM_BASE + i * 4, &rb);
+        if (rc) {
+            log_error("  HBM readback peek failed at DWORD %d (rc=%d)", i, rc);
+            rb_errors++;
+        } else {
+            log_info("  HBM[%d]: wrote=0x%08X  read=0x%08X  %s",
+                     i, index_words[i], rb,
+                     (rb == index_words[i]) ? "OK" : "MISMATCH");
+            if (rb != index_words[i]) rb_errors++;
+        }
+    }
+    if (rb_errors)
+        log_error("[Phase 1] HBM readback had %d errors!", rb_errors);
+    else
+        log_info("[Phase 1] HBM readback OK.");
+
     // Write HBM base address to accelerator registers
     rc = fpga_pci_poke(bar0, REG_HBM_BASE_LO, (uint32_t)(HBM_BASE & 0xFFFFFFFF));
     fail_on(rc, done, "Failed to write HBM_BASE_LO");
@@ -254,24 +279,47 @@ int main(int argc, char **argv)
     // Phase 2: Boot and query
     // =====================================================================
 
+    // Verify HBM base address readback from accelerator registers
+    {
+        uint32_t lo_rb, hi_rb;
+        fpga_pci_peek(bar0, REG_HBM_BASE_LO, &lo_rb);
+        fpga_pci_peek(bar0, REG_HBM_BASE_HI, &hi_rb);
+        log_info("[Phase 1] Accel HBM_BASE regs: LO=0x%08X HI=0x%08X (expect LO=0x%08X HI=0x%08X)",
+                 lo_rb, hi_rb,
+                 (uint32_t)(HBM_BASE & 0xFFFFFFFF),
+                 (uint32_t)(HBM_BASE >> 32));
+    }
+
     // Release FM_Index from reset
     log_info("[Phase 2] Releasing FM_Index from reset (auto-boot starts)...");
     rc = fpga_pci_poke(bar0, REG_CTRL, 0x0);
     fail_on(rc, done, "Failed to clear fmindex_reset");
 
-    // Poll for boot_done
+    // Poll for boot_done with progress reporting
     log_info("[Phase 2] Waiting for boot_done...");
     uint32_t ctrl_val;
     int timeout = 10000;
+    int polls = 0;
     do {
         rc = fpga_pci_peek(bar0, REG_CTRL, &ctrl_val);
         fail_on(rc, done, "Failed to read CTRL");
         if (ctrl_val & CTRL_BOOT_DONE) break;
+        if (polls < 10 || (polls % 1000) == 0)
+            log_info("  poll %d: CTRL=0x%08X", polls, ctrl_val);
+        polls++;
         usleep(100);
     } while (--timeout > 0);
 
     if (!(ctrl_val & CTRL_BOOT_DONE)) {
-        log_error("Timeout waiting for FM_Index boot. CTRL=0x%08X", ctrl_val);
+        log_error("Timeout waiting for FM_Index boot after %d polls. CTRL=0x%08X", polls, ctrl_val);
+        // Dump all readable registers for diagnostics
+        uint32_t diag;
+        fpga_pci_peek(bar0, REG_RESULT_STATUS, &diag);
+        log_error("  RESULT_STATUS=0x%08X", diag);
+        fpga_pci_peek(bar0, REG_RESULT_L, &diag);
+        log_error("  RESULT_L=0x%08X", diag);
+        fpga_pci_peek(bar0, REG_RESULT_R, &diag);
+        log_error("  RESULT_R=0x%08X", diag);
         rc = 1; goto done;
     }
     log_info("[Phase 2] FM_Index boot complete.");
