@@ -68,6 +68,7 @@ module cl_dram_hbm_dma
   cfg_bus_t  ddrd_tst_cfg_bus();
   cfg_bus_t  axi_mstr_cfg_bus();
   cfg_bus_t  int_tst_cfg_bus();
+  cfg_bus_t  fmindex_cfg_bus();
 
   scrb_bus_t ddra_scrb_bus();
   scrb_bus_t ddrb_scrb_bus();
@@ -231,12 +232,16 @@ module cl_dram_hbm_dma
     .dest_arst              (mstr_sync_rst_n          )
   );
 
-  cl_dram_dma_axi_mstr CL_DRAM_DMA_AXI_MSTR
+  // Tie off slot 5 (axi_mstr_cfg_bus) since the ATG is removed
+  assign axi_mstr_cfg_bus.ack   = 1'b1;
+  assign axi_mstr_cfg_bus.rdata = 32'hdead_beef;
+
+  cl_fmindex_accel CL_FMINDEX_ACCEL
   (
-    .aclk                   (clk_main_a0              ),
-    .aresetn                (mstr_sync_rst_n          ),
-    .cl_axi_mstr_bus        (cl_axi_mstr_bus          ),
-    .axi_mstr_cfg_bus       (axi_mstr_cfg_bus         )
+    .clk                    (clk_main_a0              ),
+    .rst_n                  (mstr_sync_rst_n          ),
+    .cfg_bus                (fmindex_cfg_bus           ),
+    .cl_axi_mstr_bus        (cl_axi_mstr_bus          )
   );
 
 ///////////////////////////////////////////////////////////////////////
@@ -343,7 +348,8 @@ module cl_dram_hbm_dma
     .ddrc_tst_cfg_bus       (hbm_stat_cfg_bus         ),
     .ddrd_tst_cfg_bus       (ddrd_tst_cfg_bus         ),
     .axi_mstr_cfg_bus       (axi_mstr_cfg_bus         ),
-    .int_tst_cfg_bus        (int_tst_cfg_bus          )
+    .int_tst_cfg_bus        (int_tst_cfg_bus          ),
+    .fmindex_cfg_bus        (fmindex_cfg_bus           )
 );
 
 

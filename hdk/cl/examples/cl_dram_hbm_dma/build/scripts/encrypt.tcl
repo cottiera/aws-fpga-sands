@@ -43,6 +43,9 @@ file copy -force $CL_DIR/design/cl_sda_slv.sv                 $src_post_enc_dir
 file copy -force $CL_DIR/design/cl_dram_dma_axi_mstr.sv       $src_post_enc_dir
 file copy -force $CL_DIR/design/cl_hbm_axi4.sv                $src_post_enc_dir
 file copy -force $CL_DIR/design/cl_hbm_wrapper.sv             $src_post_enc_dir
+file copy -force $CL_DIR/design/cl_fmindex.sv                 $src_post_enc_dir
+file copy -force $CL_DIR/design/cl_fmindex_axi_reader.sv      $src_post_enc_dir
+file copy -force $CL_DIR/design/cl_fmindex_accel.sv           $src_post_enc_dir
 
 #---- End of section replaced by Developr ---
 

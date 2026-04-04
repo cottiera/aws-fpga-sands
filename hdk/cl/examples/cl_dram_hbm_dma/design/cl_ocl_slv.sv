@@ -31,7 +31,8 @@ module cl_ocl_slv (
    cfg_bus_t.master ddrc_tst_cfg_bus,
    cfg_bus_t.master ddrd_tst_cfg_bus,
    cfg_bus_t.master axi_mstr_cfg_bus,
-   cfg_bus_t.master int_tst_cfg_bus
+   cfg_bus_t.master int_tst_cfg_bus,
+   cfg_bus_t.master fmindex_cfg_bus
 
 );
 
@@ -340,6 +341,11 @@ assign int_tst_cfg_bus.wdata = slv_tst_wdata[13];
 assign int_tst_cfg_bus.wr = slv_tst_wr[13];
 assign int_tst_cfg_bus.rd = slv_tst_rd[13];
 
+assign fmindex_cfg_bus.addr = slv_tst_addr[6];
+assign fmindex_cfg_bus.wdata = slv_tst_wdata[6];
+assign fmindex_cfg_bus.wr = slv_tst_wr[6];
+assign fmindex_cfg_bus.rd = slv_tst_rd[6];
+
 
 //respond back with deadbeef for addresses not implemented
 always_comb begin
@@ -361,13 +367,16 @@ always_comb begin
   //for AXI Master
   tst_slv_ack[5] = axi_mstr_cfg_bus.ack;
   tst_slv_rdata[5] = axi_mstr_cfg_bus.rdata;
-  //for int ATG
-  tst_slv_ack[13] = int_tst_cfg_bus.ack;
-  tst_slv_rdata[13] = int_tst_cfg_bus.rdata;
-  for(int i=6; i<13; i++) begin
+  //for FM Index accelerator
+  tst_slv_ack[6] = fmindex_cfg_bus.ack;
+  tst_slv_rdata[6] = fmindex_cfg_bus.rdata;
+  for(int i=7; i<13; i++) begin
     tst_slv_ack[i] = 1'b1;
     tst_slv_rdata[i] = 32'hdead_beef;
   end
+  //for int ATG
+  tst_slv_ack[13] = int_tst_cfg_bus.ack;
+  tst_slv_rdata[13] = int_tst_cfg_bus.rdata;
   for(int i=14; i<16; i++) begin
     tst_slv_ack[i] = 1'b1;
     tst_slv_rdata[i] = 32'hdead_beef;
