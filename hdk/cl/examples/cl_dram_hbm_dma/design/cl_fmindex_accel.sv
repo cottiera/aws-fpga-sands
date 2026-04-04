@@ -114,12 +114,17 @@ logic [31:0]              fm_r_out;
 
 assign fm_reset = fmindex_reset_q | ~rst_n;
 
-// Pack pattern registers into a flat vector
+// Pack pattern registers into a wide vector, then truncate to PAT_BITS
+localparam int PAT_VEC_BITS = PAT_WORDS * 32;
+logic [PAT_VEC_BITS-1:0] pat_wide;
+
 always_comb begin
-    fm_query_pattern = '0;
+    pat_wide = '0;
     for (int i = 0; i < PAT_WORDS; i++)
-        fm_query_pattern[i*32 +: 32] = pattern_regs[i];
+        pat_wide[i*32 +: 32] = pattern_regs[i];
 end
+
+assign fm_query_pattern = pat_wide[PAT_BITS-1:0];
 
 assign fm_query_pat_len = pat_len_q;
 assign fm_query_id      = query_id_q;
@@ -228,10 +233,9 @@ always_ff @(posedge clk) begin
                 8'h1C: hbm_base_lo_q <= cfg_wdata_q;
                 8'h20: hbm_base_hi_q <= cfg_wdata_q;
                 default: begin
-                    if (cfg_addr_q >= 8'h40 && cfg_addr_q < 8'h40 + PAT_WORDS * 4) begin
-                        int widx;
-                        widx = (cfg_addr_q - 8'h40) >> 2;
-                        pattern_regs[widx] <= cfg_wdata_q;
+                    for (int i = 0; i < PAT_WORDS; i++) begin
+                        if (cfg_addr_q == 8'(8'h40 + i * 4))
+                            pattern_regs[i] <= cfg_wdata_q;
                     end
                 end
             endcase
@@ -242,6 +246,16 @@ end
 // -------------------------------------------------------------------------
 // Register read logic
 // -------------------------------------------------------------------------
+
+// Combinational mux for pattern register reads (avoids dynamic array index)
+logic [31:0] pat_rdata;
+always_comb begin
+    pat_rdata = 32'hdead_beef;
+    for (int i = 0; i < PAT_WORDS; i++) begin
+        if (cfg_addr_q == 8'(8'h40 + i * 4))
+            pat_rdata = pattern_regs[i];
+    end
+end
 
 always_ff @(posedge clk) begin
     case (cfg_addr_q)
@@ -254,12 +268,7 @@ always_ff @(posedge clk) begin
         8'h18:   cfg_bus.rdata <= res_qid_q;
         8'h1C:   cfg_bus.rdata <= hbm_base_lo_q;
         8'h20:   cfg_bus.rdata <= hbm_base_hi_q;
-        default: begin
-            if (cfg_addr_q >= 8'h40 && cfg_addr_q < 8'h40 + PAT_WORDS * 4)
-                cfg_bus.rdata <= pattern_regs[(cfg_addr_q - 8'h40) >> 2];
-            else
-                cfg_bus.rdata <= 32'hdead_beef;
-        end
+        default: cfg_bus.rdata <= pat_rdata;
     endcase
 end
 
