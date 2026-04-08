@@ -1,26 +1,21 @@
 // ============================================================================
-// cl_fmindex_axi_reader.sv — Fixed-latency AXI4 read bridge for cl_fmindex
+// cl_fmindex_axi_reader.sv — Response-driven AXI4 read bridge for cl_fmindex
 //
 // Translates cl_fmindex's word-addressed RAM interface into 512-bit AXI4 reads
-// against HBM via the existing crossbar.  The bridge guarantees that ram_data
-// is valid exactly PIPE_DEPTH = RAM_DELAY_CYCLES + 1 clock edges after ram_req,
-// matching the shift-register timing inside cl_fmindex.
+// against HBM via the existing crossbar.  Data is delivered as soon as the AXI
+// response arrives (ram_data_valid pulses high for one cycle), eliminating the
+// fixed-latency shift registers that caused timing violations.
 //
 // Architecture:
 //   ram_req ──> addr_fifo ──> AXI AR channel (64-byte reads, ARID=0)
+//   ram_req ──> offset_fifo (4-bit DWORD selector, small depth)
 //
-//   ram_req ──> delivery shift register [RAM_DELAY_CYCLES stages]
-//                   + registered ram_data output = PIPE_DEPTH total
-//
-//   AXI R channel ──> response FIFO (in-order via ARID=0)
-//
-//   When delivery shift register output fires:
-//       ram_data <= extract_dword(resp_fifo.pop(), saved_byte_offset)
+//   AXI R channel ──> extract DWORD using offset_fifo head
+//                 ──> ram_data + ram_data_valid
 // ============================================================================
 
 module cl_fmindex_axi_reader #(
-    parameter int RAM_DELAY_CYCLES = 64,
-    parameter int RAM_FIFO_DEPTH   = 4
+    parameter int RAM_FIFO_DEPTH = 4
 ) (
     input  logic        clk,
     input  logic        rst_n,
@@ -29,6 +24,7 @@ module cl_fmindex_axi_reader #(
     input  logic        ram_req,
     input  logic [31:0] ram_addr,
     output logic [31:0] ram_data,
+    output logic        ram_data_valid,
 
     // HBM base address (byte address in crossbar space)
     input  logic [63:0] hbm_base_addr,
@@ -37,13 +33,8 @@ module cl_fmindex_axi_reader #(
     axi_bus_t.slave     cl_axi_mstr_bus
 );
 
-localparam int PIPE_DEPTH  = (RAM_DELAY_CYCLES < 1) ? 1 : (RAM_DELAY_CYCLES + 1);
-localparam int DEL_DEPTH   = (RAM_DELAY_CYCLES < 1) ? 1 : RAM_DELAY_CYCLES;
-
 // -------------------------------------------------------------------------
 // Address FIFO — buffers read requests when AXI AR backpressures
-//
-// Depth matches the max outstanding requests FM_Index will issue.
 // -------------------------------------------------------------------------
 
 localparam int ADDR_FIFO_SLOTS = (RAM_FIFO_DEPTH < 2) ? 2 : RAM_FIFO_DEPTH;
@@ -86,88 +77,58 @@ assign cl_axi_mstr_bus.arvalid = !af_empty;
 assign cl_axi_mstr_bus.arburst = 2'b01;   // INCR
 
 // -------------------------------------------------------------------------
-// Delivery shift register — DEL_DEPTH = RAM_DELAY_CYCLES stages
+// Offset FIFO — which 32-bit word to extract from 512b cache line
 //
-// Together with the registered ram_data output, this gives exactly
-// PIPE_DEPTH = RAM_DELAY_CYCLES + 1 cycles of total latency.
+// Pushed when ram_req fires, popped when AXI R response arrives.
+// AXI in-order guarantee (single ARID=0) ensures 1:1 correspondence.
 // -------------------------------------------------------------------------
 
-logic del_pipe [DEL_DEPTH];
+localparam int OF_SLOTS = (RAM_FIFO_DEPTH < 2) ? 2 : RAM_FIFO_DEPTH;
+localparam int OF_PTR_W = $clog2(OF_SLOTS);
+
+logic [3:0] offset_fifo [OF_SLOTS];
+logic [OF_PTR_W:0] of_wr, of_rd;
+
+wire of_empty = (of_wr == of_rd);
+
+wire axi_resp_fire = cl_axi_mstr_bus.rvalid && cl_axi_mstr_bus.rready;
 
 always_ff @(posedge clk) begin
     if (!rst_n) begin
-        for (int i = 0; i < DEL_DEPTH; i++)
-            del_pipe[i] <= 1'b0;
+        of_wr <= '0;
+        of_rd <= '0;
     end else begin
-        del_pipe[0] <= ram_req;
-        for (int i = 1; i < DEL_DEPTH; i++)
-            del_pipe[i] <= del_pipe[i-1];
-    end
-end
-
-wire deliver_now = del_pipe[DEL_DEPTH-1];
-
-// -------------------------------------------------------------------------
-// DWORD offset shift register — which 32-bit word to extract from 512b line
-// -------------------------------------------------------------------------
-
-logic [3:0] offset_pipe [DEL_DEPTH];
-
-always_ff @(posedge clk) begin
-    if (!rst_n) begin
-        for (int i = 0; i < DEL_DEPTH; i++)
-            offset_pipe[i] <= 4'd0;
-    end else begin
-        offset_pipe[0] <= byte_addr[5:2];
-        for (int i = 1; i < DEL_DEPTH; i++)
-            offset_pipe[i] <= offset_pipe[i-1];
-    end
-end
-
-wire [3:0] deliver_offset = offset_pipe[DEL_DEPTH-1];
-
-// -------------------------------------------------------------------------
-// Response FIFO — buffers AXI read data until delivery time
-// -------------------------------------------------------------------------
-
-localparam int RESP_FIFO_SLOTS = PIPE_DEPTH + 2;
-localparam int RF_PTR_W = $clog2(RESP_FIFO_SLOTS);
-
-logic [511:0] resp_fifo [RESP_FIFO_SLOTS];
-logic [RF_PTR_W:0] rf_wr, rf_rd;
-
-wire [RF_PTR_W:0] rf_count = rf_wr - rf_rd;
-wire rf_full  = (rf_count >= (RF_PTR_W+1)'(RESP_FIFO_SLOTS));
-wire rf_empty = (rf_wr == rf_rd);
-
-assign cl_axi_mstr_bus.rready = !rf_full;
-
-always_ff @(posedge clk) begin
-    if (!rst_n) begin
-        rf_wr <= '0;
-        rf_rd <= '0;
-    end else begin
-        if (cl_axi_mstr_bus.rvalid && cl_axi_mstr_bus.rready) begin
-            resp_fifo[rf_wr[RF_PTR_W-1:0]] <= cl_axi_mstr_bus.rdata;
-            rf_wr <= rf_wr + 1'b1;
+        if (ram_req) begin
+            offset_fifo[of_wr[OF_PTR_W-1:0]] <= byte_addr[5:2];
+            of_wr <= of_wr + 1'b1;
         end
-        if (deliver_now && !rf_empty) begin
-            rf_rd <= rf_rd + 1'b1;
+        if (axi_resp_fire && !of_empty) begin
+            of_rd <= of_rd + 1'b1;
         end
     end
 end
 
+wire [3:0] of_head = offset_fifo[of_rd[OF_PTR_W-1:0]];
+
 // -------------------------------------------------------------------------
-// Output mux — extract the correct DWORD from the response FIFO head
+// Response delivery — extract DWORD directly from AXI R data
+//
+// No buffering FIFO needed: we are always ready to accept (rready=1)
+// and process the response in the same cycle it arrives.
 // -------------------------------------------------------------------------
 
-wire [511:0] head_data = resp_fifo[rf_rd[RF_PTR_W-1:0]];
+assign cl_axi_mstr_bus.rready = 1'b1;
 
 always_ff @(posedge clk) begin
     if (!rst_n) begin
-        ram_data <= 32'd0;
-    end else if (deliver_now && !rf_empty) begin
-        ram_data <= head_data[deliver_offset*32 +: 32];
+        ram_data       <= 32'd0;
+        ram_data_valid <= 1'b0;
+    end else begin
+        ram_data_valid <= 1'b0;
+        if (axi_resp_fire && !of_empty) begin
+            ram_data       <= cl_axi_mstr_bus.rdata[of_head*32 +: 32];
+            ram_data_valid <= 1'b1;
+        end
     end
 end
 

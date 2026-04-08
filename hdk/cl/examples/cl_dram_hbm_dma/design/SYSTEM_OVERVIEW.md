@@ -167,18 +167,18 @@ end
 
 This is the FM-index formula: `new_l = C[char] + Occ(char, l)`, `new_r = C[char] + Occ(char, r)`. If the range becomes empty (`new_l >= new_r`), the pattern doesn't exist. If we've processed all characters (`loop_count == 0`), we found matches. Otherwise, go back to `SLOT_READ_CHAR` for the next letter.
 
-### The Pipeline — Hiding Memory Latency
+### The Metadata FIFO — Tracking Outstanding Requests
 
-Reading from HBM memory takes ~64 clock cycles. Rather than sitting idle, the module uses a **shift register pipeline**:
+Reading from HBM memory takes a variable number of clock cycles. The module uses a small **metadata FIFO** to track which slot and request kind each outstanding memory read belongs to:
 
 ```systemverilog
-req_t req_pipe [PIPE_DEPTH];
-req_t req_pipe_n [PIPE_DEPTH];
+req_meta_t meta_fifo [META_FIFO_SLOTS];
+logic [MF_PTR_W:0] mf_wr, mf_rd;
 ```
 
-Imagine the librarian sends a runner to fetch a page. Rather than staring at the door waiting for them to come back, the librarian starts working on a *different* query. When the runner returns 64 ticks later, a tag on the request tells the librarian which query it was for.
+When the librarian sends a runner to fetch a page, a tag (kind + slot) is pushed into the FIFO. When `ram_data_valid` fires (the runner returns with data), the tag is popped from the FIFO head — telling the librarian which query the data belongs to. This works because AXI guarantees responses arrive in the same order as requests (single ID, in-order).
 
-The round-robin pointer `rr_ptr` cycles through slots, giving each one a fair turn to issue memory requests.
+The round-robin pointer `rr_ptr` cycles through slots, giving each one a fair turn to issue memory requests. The `pending_count` limits outstanding requests to `RAM_FIFO_DEPTH` to prevent overflowing the FIFO.
 
 ### The Flip-Flop Update — Where State Actually Changes
 
@@ -286,7 +286,7 @@ The front desk manager hires the librarian (`FMINDEX`) and the book runner (`AXI
 
 This module translates the simple `ram_req` / `ram_addr` / `ram_data` interface into AXI4 bus transactions that read from HBM (High Bandwidth Memory) on the FPGA.
 
-**The core problem it solves:** The FM-index core thinks it's talking to a simple RAM with fixed latency. But HBM speaks AXI4, a complex handshake protocol with variable latency. This module makes HBM *look like* a simple fixed-latency RAM.
+**The core problem it solves:** The FM-index core needs word-level reads from a table stored in HBM. But HBM speaks AXI4, a complex handshake protocol with 512-bit cache lines and variable latency. This module translates between the two, delivering one 32-bit word per request and signalling when the data is valid via `ram_data_valid`.
 
 ### Address Translation
 
@@ -305,44 +305,25 @@ logic [63:0] addr_fifo [ADDR_FIFO_SLOTS];
 
 The book runner has a small notepad (FIFO queue). When the librarian says "fetch address X," it gets written on the notepad. The runner works through the notepad one request at a time, sending each to the AXI bus. The `& ~64'h3F` masks the address to 64-byte alignment because HBM reads whole 64-byte cache lines.
 
-### The Delivery Shift Register — The Timing Trick
+### Response-Driven Delivery
 
-This is the most clever part:
-
-```systemverilog
-logic del_pipe [DEL_DEPTH];
-
-always_ff @(posedge clk) begin
-    if (!rst_n) begin
-        for (int i = 0; i < DEL_DEPTH; i++)
-            del_pipe[i] <= 1'b0;
-    end else begin
-        del_pipe[0] <= ram_req;
-        for (int i = 1; i < DEL_DEPTH; i++)
-            del_pipe[i] <= del_pipe[i-1];
-    end
-end
-
-wire deliver_now = del_pipe[DEL_DEPTH-1];
-```
-
-Imagine a conveyor belt with exactly 64 slots. When the librarian makes a request, a token is placed on the belt. Exactly 64 ticks later, the token falls off the end and triggers "deliver now!" This guarantees the FM-index core gets its data at *exactly* the cycle it expects — no sooner, no later.
-
-A parallel conveyor belt (`offset_pipe`) carries the byte offset so the module knows *which 32-bit word* to extract from the 512-bit (64-byte) cache line:
+When a request is issued (`ram_req`), the byte offset within the 64-byte cache line is pushed into a small **offset FIFO**. When the AXI response arrives (`rvalid && rready`), the offset is popped and used to extract the correct 32-bit word:
 
 ```systemverilog
-wire [511:0] head_data = resp_fifo[rf_rd[RF_PTR_W-1:0]];
+wire axi_resp_fire = cl_axi_mstr_bus.rvalid && cl_axi_mstr_bus.rready;
 
 always_ff @(posedge clk) begin
-    if (!rst_n) begin
-        ram_data <= 32'd0;
-    end else if (deliver_now && !rf_empty) begin
-        ram_data <= head_data[deliver_offset*32 +: 32];
+    ram_data_valid <= 1'b0;
+    if (axi_resp_fire && !of_empty) begin
+        ram_data       <= cl_axi_mstr_bus.rdata[of_head*32 +: 32];
+        ram_data_valid <= 1'b1;
     end
 end
 ```
 
-The `[deliver_offset*32 +: 32]` syntax means "starting at bit position `deliver_offset * 32`, grab 32 bits." It's extracting one 4-byte word out of a 64-byte cache line.
+The `[of_head*32 +: 32]` syntax means "starting at bit position `of_head * 32`, grab 32 bits" — extracting one 4-byte word out of a 64-byte cache line.
+
+This approach adapts to any HBM latency automatically. There are no fixed-delay shift registers, so the design is robust against latency variations and avoids the timing-closure pressure that long shift register chains create.
 
 ### AXI Write Tie-Offs
 
@@ -357,9 +338,9 @@ Here's the end-to-end journey of a query:
 1. **Software** writes a DNA pattern (e.g., "ACGT") into the registers of `cl_fmindex_accel` and hits "submit"
 2. **`cl_fmindex_accel`** packs the pattern into a wide bit vector and presents it to `cl_fmindex` with `query_valid=1`
 3. **`cl_fmindex`** accepts the query into a free slot, then starts the backward search — for each character (right to left), it needs 3 memory lookups: `Occ(char, l)`, `Occ(char, r)`, `C[char]`
-4. **`cl_fmindex`** issues `ram_req` + `ram_addr` for each lookup
-5. **`cl_fmindex_axi_reader`** translates that into an AXI4 read to HBM, fetches a 64-byte cache line, and delivers the correct 4-byte word back exactly 65 cycles later
-6. **`cl_fmindex`** uses the returned data to narrow the range `[l, r)`, then repeats for the next character
+4. **`cl_fmindex`** issues `ram_req` + `ram_addr` for each lookup, and pushes request metadata (kind + slot) into its metadata FIFO
+5. **`cl_fmindex_axi_reader`** translates that into an AXI4 read to HBM, fetches a 64-byte cache line, and delivers the correct 4-byte word back when the response arrives (signalled by `ram_data_valid`)
+6. **`cl_fmindex`** pops the metadata FIFO to identify which slot the data belongs to, uses the returned data to narrow the range `[l, r)`, then repeats for the next character
 7. When all characters are processed, the slot reaches `SLOT_DONE` (match found) or `SLOT_FAIL` (no match)
 8. **`cl_fmindex_accel`** latches the result into readable registers and sets `result_pending`
 9. **Software** polls the CTRL register, sees the result is ready, and reads out `l` and `r`

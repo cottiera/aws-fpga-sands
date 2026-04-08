@@ -212,7 +212,7 @@ test_fmindex --index <path.fmi> --pattern <string>
 | Symptom                             | Likely Cause                      | Fix                                                                   |
 | ----------------------------------- | --------------------------------- | --------------------------------------------------------------------- |
 | `HBM not ready (VLED bit 0 is 0)`   | HBM didn't initialize             | Check AFI loaded correctly, reload                                    |
-| `Timeout waiting for boot`          | AXI read latency > pipeline depth | Increase `RAM_DELAY_CYCLES` in `cl_dram_hbm_dma.sv`                   |
+| `Timeout waiting for boot`          | AXI bus not connected / AFI issue | Verify AFI loaded, check `fpga-describe-local-image -S 0 -R`         |
 | `FAIL` on pattern that should match | Pattern encoding mismatch         | Verify character-to-code mapping matches the indexer                  |
 | Wrong query ID in result            | DCP timing violation              | Rebuild until timing passes cleanly                                   |
 | `Slot is not ready`                 | AFI not loaded                    | Run `fpga-load-local-image`, then `fpga-describe-local-image -S 0 -R` |

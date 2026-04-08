@@ -23,8 +23,7 @@
 module cl_fmindex_accel #(
     parameter int PAT_MAX_LEN     = 150,
     parameter int NUM_SLOTS       = 4,
-    parameter int RAM_FIFO_DEPTH  = 4,
-    parameter int RAM_DELAY_CYCLES = 64
+    parameter int RAM_FIFO_DEPTH  = 4
 ) (
     input  logic       clk,
     input  logic       rst_n,
@@ -104,6 +103,7 @@ logic [PAT_LEN_W-1:0]    fm_query_pat_len;
 logic                     fm_ram_req;
 logic [31:0]              fm_ram_addr;
 logic [31:0]              fm_ram_data;
+logic                     fm_ram_data_valid;
 
 logic                     fm_result_valid;
 logic                     fm_result_done;
@@ -132,8 +132,7 @@ assign fm_query_id      = query_id_q;
 cl_fmindex #(
     .PAT_MAX_LEN     (PAT_MAX_LEN),
     .NUM_SLOTS        (NUM_SLOTS),
-    .RAM_FIFO_DEPTH   (RAM_FIFO_DEPTH),
-    .RAM_DELAY_CYCLES (RAM_DELAY_CYCLES)
+    .RAM_FIFO_DEPTH   (RAM_FIFO_DEPTH)
 ) FMINDEX (
     .clk              (clk),
     .reset            (fm_reset),
@@ -144,6 +143,7 @@ cl_fmindex #(
     .query_ready      (fm_query_ready),
     .ram_req          (fm_ram_req),
     .ram_data         (fm_ram_data),
+    .ram_data_valid   (fm_ram_data_valid),
     .ram_addr         (fm_ram_addr),
     .result_valid     (fm_result_valid),
     .result_done      (fm_result_done),
@@ -160,7 +160,6 @@ cl_fmindex #(
 // -------------------------------------------------------------------------
 
 cl_fmindex_axi_reader #(
-    .RAM_DELAY_CYCLES (RAM_DELAY_CYCLES),
     .RAM_FIFO_DEPTH   (RAM_FIFO_DEPTH)
 ) AXI_READER (
     .clk              (clk),
@@ -168,6 +167,7 @@ cl_fmindex_axi_reader #(
     .ram_req          (fm_ram_req),
     .ram_addr         (fm_ram_addr),
     .ram_data         (fm_ram_data),
+    .ram_data_valid   (fm_ram_data_valid),
     .hbm_base_addr    ({hbm_base_hi_q, hbm_base_lo_q}),
     .cl_axi_mstr_bus  (cl_axi_mstr_bus)
 );

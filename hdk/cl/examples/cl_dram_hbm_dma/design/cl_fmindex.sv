@@ -1,16 +1,15 @@
 // ============================================================================
 // cl_fmindex.sv — FM-index backward-search engine (multi-slot, pipelined)
 //
-// Copied from sands/fmindex_sv/FM_Index.sv with `define macros converted to
-// localparam to avoid collisions with the HDK global include namespace.
-// No algorithmic or interface changes.
+// Response-driven variant: uses a small metadata FIFO instead of a
+// RAM_DELAY_CYCLES-deep shift register to track outstanding requests.
+// Data delivery is signalled by the ram_data_valid input from the AXI reader.
 // ============================================================================
 
 module cl_fmindex #(
     parameter int PAT_MAX_LEN = 150,
     parameter int NUM_SLOTS = 4,
-    parameter int RAM_FIFO_DEPTH = 4,
-    parameter int RAM_DELAY_CYCLES = 64
+    parameter int RAM_FIFO_DEPTH = 4
 ) (
     input logic clk,
     input logic reset,
@@ -23,6 +22,7 @@ module cl_fmindex #(
 
     output logic ram_req,
     input logic [IDX_WIDTH-1:0] ram_data,
+    input logic ram_data_valid,
     output logic [31:0] ram_addr,
 
     output logic result_valid,
@@ -45,7 +45,6 @@ localparam int PAT_IDX_W = (PAT_MAX_LEN <= 1) ? 1 : $clog2(PAT_MAX_LEN);
 localparam int LOOP_COUNT_W = $clog2(PAT_MAX_LEN + 1);
 localparam int SLOT_W = (NUM_SLOTS <= 1) ? 1 : $clog2(NUM_SLOTS);
 localparam int REQ_FIFO_DEPTH = (RAM_FIFO_DEPTH < 1) ? 1 : RAM_FIFO_DEPTH;
-localparam int PIPE_DEPTH = (RAM_DELAY_CYCLES < 1) ? 1 : (RAM_DELAY_CYCLES + 1);
 localparam int FIFO_W = $clog2(REQ_FIFO_DEPTH + 1);
 
 typedef enum logic [2:0] {
@@ -81,10 +80,9 @@ typedef enum logic [2:0] {
 } req_kind_t;
 
 typedef struct packed {
-    logic valid;
     req_kind_t kind;
     logic [SLOT_W-1:0] slot;
-} req_t;
+} req_meta_t;
 
 typedef struct packed {
     logic [31:0] query_id;
@@ -167,8 +165,20 @@ logic [FIFO_W-1:0] pending_count, pending_count_n;
 slot_t slots [NUM_SLOTS];
 slot_t slots_n [NUM_SLOTS];
 
-req_t req_pipe [PIPE_DEPTH];
-req_t req_pipe_n [PIPE_DEPTH];
+// -------------------------------------------------------------------------
+// Metadata FIFO — tracks {kind, slot} for each outstanding RAM request.
+// Pushed when a request is issued, popped when ram_data_valid arrives.
+// -------------------------------------------------------------------------
+
+localparam int META_FIFO_SLOTS = (REQ_FIFO_DEPTH < 2) ? 2 : REQ_FIFO_DEPTH;
+localparam int MF_PTR_W = $clog2(META_FIFO_SLOTS);
+
+req_meta_t meta_fifo [META_FIFO_SLOTS];
+logic [MF_PTR_W:0] mf_wr, mf_rd;
+
+wire mf_empty = (mf_wr == mf_rd);
+req_meta_t mf_head;
+assign mf_head = meta_fifo[mf_rd[MF_PTR_W-1:0]];
 
 logic query_ready_n;
 logic result_valid_n;
@@ -198,12 +208,6 @@ always_comb begin
         slots_n[i] = slots[i];
     end
 
-    for (int i = 0; i < PIPE_DEPTH; i++) begin
-        req_pipe_n[i].valid = 1'b0;
-        req_pipe_n[i].kind = REQ_BOOT_MAGIC;
-        req_pipe_n[i].slot = '0;
-    end
-
     query_ready_n = 1'b0;
     result_valid_n = 1'b0;
     result_done_n = 1'b0;
@@ -221,15 +225,12 @@ always_comb begin
     resp_kind = REQ_BOOT_MAGIC;
     resp_slot = '0;
 
-    if (req_pipe[PIPE_DEPTH-1].valid) begin
+    // ---- Response handling: triggered by ram_data_valid from AXI reader ----
+    if (ram_data_valid && !mf_empty) begin
         resp_valid = 1'b1;
-        resp_kind = req_pipe[PIPE_DEPTH-1].kind;
-        resp_slot = req_pipe[PIPE_DEPTH-1].slot;
+        resp_kind = mf_head.kind;
+        resp_slot = mf_head.slot;
         pending_count_n = pending_count_n - 1'b1;
-    end
-
-    for (int i = PIPE_DEPTH - 1; i > 0; i--) begin
-        req_pipe_n[i] = req_pipe[i-1];
     end
 
     if (resp_valid) begin
@@ -415,9 +416,6 @@ always_comb begin
     if (issue_valid) begin
         ram_req = 1'b1;
         ram_addr = issue_addr;
-        req_pipe_n[0].valid = 1'b1;
-        req_pipe_n[0].kind = issue_kind;
-        req_pipe_n[0].slot = issue_slot;
         pending_count_n = pending_count_n + 1'b1;
     end
 end
@@ -455,11 +453,8 @@ always_ff @(posedge clk) begin
             slots[i].c_base <= '0;
             slots[i].state <= SLOT_FREE;
         end
-        for (int i = 0; i < PIPE_DEPTH; i++) begin
-            req_pipe[i].valid <= 1'b0;
-            req_pipe[i].kind <= REQ_BOOT_MAGIC;
-            req_pipe[i].slot <= '0;
-        end
+        mf_wr <= '0;
+        mf_rd <= '0;
     end else begin
         boot_state <= boot_state_n;
         seq_len <= seq_len_n;
@@ -471,8 +466,17 @@ always_ff @(posedge clk) begin
         for (int i = 0; i < NUM_SLOTS; i++) begin
             slots[i] <= slots_n[i];
         end
-        for (int i = 0; i < PIPE_DEPTH; i++) begin
-            req_pipe[i] <= req_pipe_n[i];
+
+        // Metadata FIFO write (new request issued)
+        if (issue_valid) begin
+            meta_fifo[mf_wr[MF_PTR_W-1:0]].kind <= issue_kind;
+            meta_fifo[mf_wr[MF_PTR_W-1:0]].slot <= issue_slot;
+            mf_wr <= mf_wr + 1'b1;
+        end
+
+        // Metadata FIFO read (response consumed)
+        if (ram_data_valid && !mf_empty) begin
+            mf_rd <= mf_rd + 1'b1;
         end
     end
 end
