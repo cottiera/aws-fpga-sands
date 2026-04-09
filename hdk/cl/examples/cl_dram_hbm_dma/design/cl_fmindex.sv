@@ -195,6 +195,16 @@ logic [SLOT_W-1:0] resp_slot;
 req_kind_t resp_kind;
 logic resp_valid;
 
+// Declare all loop/temporary variables at module scope to avoid
+// Vivado synthesis issues with local declarations inside always_comb.
+logic [CHAR_WIDTH-1:0] zc_ch;        // zero-check character
+logic [CHAR_WIDTH-1:0] iss_ch;       // issue-logic character
+logic [31:0]           cbase_new_l;   // C_BASE response temporaries
+logic [31:0]           cbase_new_r;
+int                    iss_idx;       // issue loop index
+int                    alloc_idx;     // alloc loop index
+int                    emit_idx;      // emit loop index
+
 always_comb begin
     boot_state_n = boot_state;
     seq_len_n = seq_len;
@@ -224,6 +234,13 @@ always_comb begin
     resp_valid = 1'b0;
     resp_kind = REQ_BOOT_MAGIC;
     resp_slot = '0;
+    zc_ch = '0;
+    iss_ch = '0;
+    cbase_new_l = 32'd0;
+    cbase_new_r = 32'd0;
+    iss_idx = 0;
+    alloc_idx = 0;
+    emit_idx = 0;
 
     // ---- Response handling: triggered by ram_data_valid from AXI reader ----
     if (ram_data_valid && !mf_empty) begin
@@ -264,14 +281,12 @@ always_comb begin
         end
 
         REQ_C_BASE: begin
-            logic [31:0] new_l;
-            logic [31:0] new_r;
-            new_l = ram_data + slots_n[resp_slot].rank_l;
-            new_r = ram_data + slots_n[resp_slot].rank_r;
+            cbase_new_l = ram_data + slots_n[resp_slot].rank_l;
+            cbase_new_r = ram_data + slots_n[resp_slot].rank_r;
             slots_n[resp_slot].c_base = ram_data;
-            slots_n[resp_slot].l = new_l;
-            slots_n[resp_slot].r = new_r;
-            if (new_l >= new_r) begin
+            slots_n[resp_slot].l = cbase_new_l;
+            slots_n[resp_slot].r = cbase_new_r;
+            if (cbase_new_l >= cbase_new_r) begin
                 slots_n[resp_slot].state = SLOT_FAIL;
             end else if (slots_n[resp_slot].loop_count == 0) begin
                 slots_n[resp_slot].state = SLOT_DONE;
@@ -287,9 +302,8 @@ always_comb begin
 
     for (int i = 0; i < NUM_SLOTS; i++) begin
         if (slots_n[i].state == SLOT_READ_CHAR) begin
-            logic [CHAR_WIDTH-1:0] ch;
-            ch = slot_char(slots_n[i].pattern, slots_n[i].pat_idx);
-            if (ch == 0) begin
+            zc_ch = slot_char(slots_n[i].pattern, slots_n[i].pat_idx);
+            if (zc_ch == 0) begin
                 if (slots_n[i].loop_count == 0) begin
                     slots_n[i].state = SLOT_DONE;
                 end else begin
@@ -332,37 +346,35 @@ always_comb begin
 
     if (!issue_valid && boot_state_n == BOOT_DONE && pending_count_n < FIFO_W'(REQ_FIFO_DEPTH)) begin
         for (int offset = 0; offset < NUM_SLOTS; offset++) begin
-            int idx;
-            idx = wrap_idx(int'(rr_ptr), offset);
-            if (!issue_valid && slot_can_issue(slots_n[idx].state)) begin
-                logic [CHAR_WIDTH-1:0] ch;
-                ch = slot_char(slots_n[idx].pattern, slots_n[idx].pat_idx);
-                if (slots_n[idx].state == SLOT_READ_CHAR) begin
-                    if (ch != 0) begin
+            iss_idx = wrap_idx(int'(rr_ptr), offset);
+            if (!issue_valid && slot_can_issue(slots_n[iss_idx].state)) begin
+                iss_ch = slot_char(slots_n[iss_idx].pattern, slots_n[iss_idx].pat_idx);
+                if (slots_n[iss_idx].state == SLOT_READ_CHAR) begin
+                    if (iss_ch != 0) begin
                         issue_valid = 1'b1;
                         issue_kind = REQ_OCC_L;
-                        issue_slot = idx[SLOT_W-1:0];
-                        issue_addr = occ_addr(ch, slots_n[idx].l, sigma_m1_n);
-                        slots_n[idx].cur_char = ch;
-                        slots_n[idx].state = SLOT_WAIT_OCC_L;
-                        slots_n[idx].loop_count = slots_n[idx].loop_count - 1'b1;
-                        slots_n[idx].pat_idx = slots_n[idx].pat_idx - 1'b1;
-                        rr_ptr_n = (idx == NUM_SLOTS - 1) ? SLOT_W'(0) : SLOT_W'(idx + 1);
+                        issue_slot = iss_idx[SLOT_W-1:0];
+                        issue_addr = occ_addr(iss_ch, slots_n[iss_idx].l, sigma_m1_n);
+                        slots_n[iss_idx].cur_char = iss_ch;
+                        slots_n[iss_idx].state = SLOT_WAIT_OCC_L;
+                        slots_n[iss_idx].loop_count = slots_n[iss_idx].loop_count - 1'b1;
+                        slots_n[iss_idx].pat_idx = slots_n[iss_idx].pat_idx - 1'b1;
+                        rr_ptr_n = (iss_idx == NUM_SLOTS - 1) ? SLOT_W'(0) : SLOT_W'(iss_idx + 1);
                     end
-                end else if (slots_n[idx].state == SLOT_READY_OCC_R) begin
+                end else if (slots_n[iss_idx].state == SLOT_READY_OCC_R) begin
                     issue_valid = 1'b1;
                     issue_kind = REQ_OCC_R;
-                    issue_slot = idx[SLOT_W-1:0];
-                    issue_addr = occ_addr(slots_n[idx].cur_char, slots_n[idx].r, sigma_m1_n);
-                    slots_n[idx].state = SLOT_WAIT_OCC_R;
-                    rr_ptr_n = (idx == NUM_SLOTS - 1) ? SLOT_W'(0) : SLOT_W'(idx + 1);
-                end else if (slots_n[idx].state == SLOT_READY_C_BASE) begin
+                    issue_slot = iss_idx[SLOT_W-1:0];
+                    issue_addr = occ_addr(slots_n[iss_idx].cur_char, slots_n[iss_idx].r, sigma_m1_n);
+                    slots_n[iss_idx].state = SLOT_WAIT_OCC_R;
+                    rr_ptr_n = (iss_idx == NUM_SLOTS - 1) ? SLOT_W'(0) : SLOT_W'(iss_idx + 1);
+                end else if (slots_n[iss_idx].state == SLOT_READY_C_BASE) begin
                     issue_valid = 1'b1;
                     issue_kind = REQ_C_BASE;
-                    issue_slot = idx[SLOT_W-1:0];
-                    issue_addr = c_arr_addr(slots_n[idx].cur_char);
-                    slots_n[idx].state = SLOT_WAIT_C_BASE;
-                    rr_ptr_n = (idx == NUM_SLOTS - 1) ? SLOT_W'(0) : SLOT_W'(idx + 1);
+                    issue_slot = iss_idx[SLOT_W-1:0];
+                    issue_addr = c_arr_addr(slots_n[iss_idx].cur_char);
+                    slots_n[iss_idx].state = SLOT_WAIT_C_BASE;
+                    rr_ptr_n = (iss_idx == NUM_SLOTS - 1) ? SLOT_W'(0) : SLOT_W'(iss_idx + 1);
                 end
             end
         end
@@ -371,41 +383,39 @@ always_comb begin
     query_ready_n = 1'b0;
     if (boot_state_n == BOOT_DONE) begin
         for (int offset = 0; offset < NUM_SLOTS; offset++) begin
-            int idx;
-            idx = wrap_idx(int'(alloc_ptr), offset);
-            if (!query_ready_n && slots[idx].state == SLOT_FREE) begin
+            alloc_idx = wrap_idx(int'(alloc_ptr), offset);
+            if (!query_ready_n && slots[alloc_idx].state == SLOT_FREE) begin
                 query_ready_n = 1'b1;
                 if (query_valid) begin
-                    slots_n[idx].query_id = query_id;
-                    slots_n[idx].pattern = query_pattern;
-                    slots_n[idx].pat_len = query_pat_len;
-                    slots_n[idx].pat_idx = PAT_IDX_W'(PAT_MAX_LEN - 1);
-                    slots_n[idx].loop_count = query_pat_len;
-                    slots_n[idx].cur_char = '0;
-                    slots_n[idx].l = 32'd0;
-                    slots_n[idx].r = seq_len_n;
-                    slots_n[idx].rank_l = 32'd0;
-                    slots_n[idx].rank_r = 32'd0;
-                    slots_n[idx].c_base = 32'd0;
-                    slots_n[idx].state = SLOT_READ_CHAR;
-                    alloc_ptr_n = (idx == NUM_SLOTS - 1) ? SLOT_W'(0) : SLOT_W'(idx + 1);
+                    slots_n[alloc_idx].query_id = query_id;
+                    slots_n[alloc_idx].pattern = query_pattern;
+                    slots_n[alloc_idx].pat_len = query_pat_len;
+                    slots_n[alloc_idx].pat_idx = PAT_IDX_W'(query_pat_len - 1);
+                    slots_n[alloc_idx].loop_count = query_pat_len;
+                    slots_n[alloc_idx].cur_char = '0;
+                    slots_n[alloc_idx].l = 32'd0;
+                    slots_n[alloc_idx].r = seq_len_n;
+                    slots_n[alloc_idx].rank_l = 32'd0;
+                    slots_n[alloc_idx].rank_r = 32'd0;
+                    slots_n[alloc_idx].c_base = 32'd0;
+                    slots_n[alloc_idx].state = SLOT_READ_CHAR;
+                    alloc_ptr_n = (alloc_idx == NUM_SLOTS - 1) ? SLOT_W'(0) : SLOT_W'(alloc_idx + 1);
                 end
             end
         end
     end
 
     for (int offset = 0; offset < NUM_SLOTS; offset++) begin
-        int idx;
-        idx = wrap_idx(int'(emit_ptr), offset);
-        if (!result_valid_n && is_terminal(slots_n[idx].state)) begin
+        emit_idx = wrap_idx(int'(emit_ptr), offset);
+        if (!result_valid_n && is_terminal(slots_n[emit_idx].state)) begin
             result_valid_n = 1'b1;
-            result_done_n = (slots_n[idx].state == SLOT_DONE);
-            result_fail_n = (slots_n[idx].state == SLOT_FAIL);
-            result_query_id_n = slots_n[idx].query_id;
-            result_l_n = slots_n[idx].l;
-            result_r_n = slots_n[idx].r;
-            slots_n[idx].state = SLOT_FREE;
-            emit_ptr_n = (idx == NUM_SLOTS - 1) ? SLOT_W'(0) : SLOT_W'(idx + 1);
+            result_done_n = (slots_n[emit_idx].state == SLOT_DONE);
+            result_fail_n = (slots_n[emit_idx].state == SLOT_FAIL);
+            result_query_id_n = slots_n[emit_idx].query_id;
+            result_l_n = slots_n[emit_idx].l;
+            result_r_n = slots_n[emit_idx].r;
+            slots_n[emit_idx].state = SLOT_FREE;
+            emit_ptr_n = (emit_idx == NUM_SLOTS - 1) ? SLOT_W'(0) : SLOT_W'(emit_idx + 1);
         end
     end
 
