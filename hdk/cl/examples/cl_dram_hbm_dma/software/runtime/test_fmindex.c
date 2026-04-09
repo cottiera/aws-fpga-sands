@@ -93,7 +93,7 @@ static int encode_pattern(const char *str, uint32_t *encoded_words, int *pat_len
                 fprintf(stderr, "Unknown character '%c' in pattern\n", str[i]);
                 return -1;
         }
-        int bit_pos = (PAT_MAX_LEN - len + i) * CHAR_WIDTH;
+        int bit_pos = i * CHAR_WIDTH;
         int word_idx = bit_pos / 32;
         int bit_off  = bit_pos % 32;
         encoded_words[word_idx] |= (code << bit_off);
